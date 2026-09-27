@@ -20,19 +20,15 @@ struct SyncCommand: ParsableCommand {
     @Option(name: .long, help: "Start from this logId (default: latest)")
     var sinceLogId: Int64?
 
-    @Option(name: .long, help: "Path to database file")
-    var db: String?
-
-    @Option(name: .long, help: "Database encryption key")
-    var key: String?
+    @OptionGroup var access: DatabaseAccessOptions
 
     func run() throws {
-        let (path, secureKey) = try resolveDatabasePath(dbPath: db, key: key)
+        let resolved = try access.resolve()
 
         if !follow && webhook == nil {
             // One-shot: show current high-water mark
-            let reader = DatabaseReader(databasePath: path)
-            try reader.open(key: secureKey)
+            let reader = DatabaseReader(databasePath: resolved.databasePath)
+            try reader.openValidated(key: resolved.key, expectedUserId: resolved.userId, timeout: access.accessTimeout)
             defer { reader.close() }
             let maxId = try reader.maxLogId()
             print("{\"status\":\"ready\",\"max_log_id\":\(maxId)}")
@@ -48,10 +44,11 @@ struct SyncCommand: ParsableCommand {
         }
 
         let watcher = DatabaseWatcher(
-            databasePath: path,
-            key: secureKey,
+            databasePath: resolved.databasePath,
+            key: resolved.key,
             pollInterval: interval,
-            startFromLogId: sinceLogId
+            startFromLogId: sinceLogId,
+            expectedUserId: resolved.userId
         )
 
         // Handle Ctrl-C gracefully
@@ -87,51 +84,4 @@ struct SyncCommand: ParsableCommand {
             }
         )
     }
-}
-
-/// Resolve database path and key without opening the database.
-func resolveDatabasePath(dbPath: String?, key: String?) throws -> (path: String, key: String?) {
-    if let dbPath {
-        return (dbPath, key)
-    }
-    let uuid = try DeviceInfo.platformUUID()
-
-    // Try standard path: derive userId → derive dbName → find file
-    if let uid = try? DeviceInfo.userId() {
-        let dbName = KeyDerivation.databaseName(userId: uid, uuid: uuid)
-        let candidates = [
-            "\(DeviceInfo.containerPath)/\(dbName)",
-            "\(DeviceInfo.containerPath)/\(dbName).db",
-        ]
-        if let found = candidates.first(where: { FileManager.default.fileExists(atPath: $0) }) {
-            let secureKey = key ?? KeyDerivation.secureKey(userId: uid, uuid: uuid)
-            return (found, secureKey)
-        }
-    }
-
-    // Fallback: scan for DB file, try candidate userIds for the key
-    guard let discoveredPath = DeviceInfo.discoverDatabaseFile() else {
-        let uid = try DeviceInfo.userId()
-        let dbName = KeyDerivation.databaseName(userId: uid, uuid: uuid)
-        throw KakaoError.databaseNotFound("\(DeviceInfo.containerPath)/\(dbName)")
-    }
-
-    if let key {
-        return (discoveredPath, key)
-    }
-
-    // Try candidate userIds to find a working key
-    var candidateIds = (try? DeviceInfo.userId()).map { [$0] } ?? [Int]()
-    candidateIds += DeviceInfo.candidateUserIds().filter { !candidateIds.contains($0) }
-    for uid in candidateIds {
-        let candidateKey = KeyDerivation.secureKey(userId: uid, uuid: uuid)
-        let reader = DatabaseReader(databasePath: discoveredPath)
-        if reader.tryOpen(key: candidateKey) {
-            reader.close()
-            return (discoveredPath, candidateKey)
-        }
-    }
-
-    // Return the discovered path without a key — caller will get a decryption error
-    return (discoveredPath, nil)
 }

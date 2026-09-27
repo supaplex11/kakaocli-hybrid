@@ -33,16 +33,10 @@ struct HarvestCommand: ParsableCommand {
     @Flag(name: .long, help: "Show what would be done without doing it")
     var dryRun = false
 
-    @Option(name: .long, help: "Path to database file")
-    var db: String?
-
-    @Option(name: .long, help: "Database encryption key")
-    var key: String?
+    @OptionGroup var access: DatabaseAccessOptions
 
     func run() throws {
-        let (path, secureKey) = try resolveDatabasePath(dbPath: db, key: key)
-        let reader = DatabaseReader(databasePath: path)
-        try reader.open(key: secureKey)
+        let reader = try access.open()
         defer { reader.close() }
 
         let metadata = MetadataStore()

@@ -8,14 +8,10 @@ struct SchemaCommand: ParsableCommand {
         abstract: "Dump the database schema (for reverse engineering)"
     )
 
-    @Option(name: .long, help: "Path to database file")
-    var db: String?
-
-    @Option(name: .long, help: "Database encryption key")
-    var key: String?
+    @OptionGroup var access: DatabaseAccessOptions
 
     func run() throws {
-        let reader = try openDatabase(dbPath: db, key: key)
+        let reader = try access.open()
         defer { reader.close() }
 
         let tables = try reader.schema()

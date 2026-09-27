@@ -59,6 +59,54 @@ final class ReceiveStoreTests: XCTestCase {
         let attributes = try FileManager.default.attributesOfItem(atPath: path)
         XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
     }
+    func testBaselineChangeEmitsUpdateAfterReopen() throws {
+        let dir = try scratch(); defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("owned/inbox.sqlite").path
+        do {
+            let store = try ReceiveStore(path: path)
+            try store.ingest([try synthetic()], account: "a", source: "fixture", replay: false, now: 0)
+        }
+        let store = try ReceiveStore(path: path)
+        try store.ingest([try synthetic()], account: "a", source: "fixture", replay: true, now: 1)
+        XCTAssertNil(try store.claim(account: "a", now: 1))
+        try store.ingest([try synthetic(body: "changed")], account: "a", source: "fixture", replay: false, now: 2)
+        let claim = try XCTUnwrap(store.claim(account: "a", now: 2))
+        XCTAssertEqual(claim.revision, 2)
+        try store.complete(claim, now: 3)
+        try store.ingest([try synthetic(body: "changed")], account: "a", source: "fixture", replay: true, now: 4)
+        XCTAssertNil(try store.claim(account: "a", now: 4))
+    }
+    func testVersionOneSchemaAndCorruptRevisionAreChecked() throws {
+        let dir = try scratch(); defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("owned/inbox.sqlite").path
+        let store = try ReceiveStore(path: path)
+        try store.ingest([try synthetic()], account: "a", source: "fixture", replay: true, now: 0)
+        try fixtureDB(path, sql: "UPDATE deliveries SET revision='not-a-number'")
+        XCTAssertThrowsError(try store.claim(account: "a", now: 0)) { error in
+            XCTAssertEqual(String(describing: error), ReceiveError.corruptStore.description)
+        }
+        XCTAssertEqual(try store.deliveryCounts()["pending"], 1)
+        try fixtureDB(path, sql: "UPDATE observations SET revision='not-a-number'")
+        XCTAssertThrowsError(try store.ingest([try synthetic(body: "changed")], account: "a", source: "fixture", replay: true, now: 1))
+        try fixtureDB(path, sql: "UPDATE observations SET revision=9223372036854775807")
+        XCTAssertThrowsError(try store.ingest([try synthetic(body: "changed")], account: "a", source: "fixture", replay: true, now: 1))
+        try fixtureDB(path, sql: "ALTER TABLE deliveries RENAME COLUMN payload TO wrong")
+        XCTAssertThrowsError(try ReceiveStore(path: path)) { error in
+            XCTAssertEqual(String(describing: error), ReceiveError.incompatibleSchema.description)
+        }
+    }
+    func testShutdownReleaseDoesNotExhaustRetries() throws {
+        let dir = try scratch(); defer { try? FileManager.default.removeItem(at: dir) }
+        let store = try ReceiveStore(path: dir.appendingPathComponent("owned/inbox.sqlite").path)
+        try store.ingest([try synthetic()], account: "a", source: "fixture", replay: true, now: 0)
+        for _ in 0..<10 {
+            let claim = try XCTUnwrap(store.claim(account: "a", now: 1))
+            try store.release(claim)
+        }
+        let claim = try XCTUnwrap(store.claim(account: "a", now: 1))
+        try store.fail(claim, now: 2)
+        XCTAssertEqual(try store.deliveryCounts()["pending"], 1)
+    }
     func testLeaseExpiryStaleAckRetryAndQuarantine() throws {
         let dir = try scratch(); defer { try? FileManager.default.removeItem(at: dir) }
         let path = dir.appendingPathComponent("owned/inbox.sqlite").path

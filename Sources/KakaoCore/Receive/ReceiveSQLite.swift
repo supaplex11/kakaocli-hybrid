@@ -2,9 +2,11 @@ import Foundation
 import CSQLCipher
 
 public enum ReceiveError: Error, CustomStringConvertible {
-    case missingSource, permissionDenied, incompatibleSchema, sourceLimit, database(Int32), unsafeStore, staleClaim, sinkFailed
+    case corruptStore, stopped, missingSource, permissionDenied, incompatibleSchema, sourceLimit, database(Int32), unsafeStore, staleClaim, sinkFailed
     public var description: String {
         switch self {
+        case .corruptStore: return "Invalid persisted receive data; no payload logged."
+        case .stopped: return "Receive stopped; unfinished delivery remains retryable."
         case .missingSource: return "Notification database not found; specify --notification-db."
         case .permissionDenied: return "Notification database is unreadable. Grant Full Disk Access to the invoking terminal/binary in System Settings, then retry. No permissions were changed."
         case .incompatibleSchema: return "Unsupported database schema; checkpoint unchanged."

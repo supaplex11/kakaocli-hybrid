@@ -45,7 +45,29 @@ public final class ReceiveStore {
                 try db.exec("PRAGMA user_version=1")
             }
         }
+        try validateSchema()
         try db.exec("PRAGMA synchronous=FULL")
+    }
+
+    private func validateSchema() throws {
+        let expected: [String: [(String, String, String, String)]] = [
+            "checkpoints": [("account","TEXT","1","1"),("source","TEXT","1","2")],
+            "observations": [("event_id","TEXT","0","1"),("fingerprint","TEXT","1","0"),("revision","INTEGER","1","0"),("baseline","INTEGER","1","0")],
+            "deliveries": [("event_id","TEXT","1","1"),("revision","INTEGER","1","2"),("account","TEXT","1","0"),("payload","TEXT","1","0"),("state","TEXT","1","0"),("attempts","INTEGER","1","0"),("available","REAL","1","0"),("token","TEXT","0","0")]
+        ]
+        for (table, columns) in expected {
+            let rows = try db.rows("PRAGMA table_info(\(table))")
+            guard rows.count == columns.count else { throw ReceiveError.incompatibleSchema }
+            for (row, column) in zip(rows, columns) {
+                guard row.count >= 6, row[1] == column.0, row[2] == column.1,
+                      row[3] == column.2, row[5] == column.3 else { throw ReceiveError.incompatibleSchema }
+            }
+        }
+    }
+
+    private func positiveRevision(_ value: String?) throws -> Int {
+        guard let value, let number = Int(value), number > 0, number < Int.max else { throw ReceiveError.corruptStore }
+        return number
     }
 
     public func ingest(_ observations: [NotificationObservation], account: String, source: String, replay: Bool, now: Double) throws {
@@ -63,10 +85,13 @@ public final class ReceiveStore {
                 var event = ReceiveEvent(account: account, observation: observation, observedAt: Date(timeIntervalSince1970: now))
                 let fingerprint = ReceiveEvent.digest(String(decoding: try encoder.encode(observation), as: UTF8.self))
                 let previous = try db.rows("SELECT fingerprint,revision,baseline FROM observations WHERE event_id=?", [event.eventId]).first
-                if previous?[0] == fingerprint { continue }
-                event.revision = previous.flatMap { Int($0[1] ?? "") }.map { $0 + 1 } ?? 1
-                let baseline = previous?[2] == "1" || (previous == nil && first && !replay)
-                try db.exec("INSERT INTO observations VALUES(?,?,?,?) ON CONFLICT(event_id) DO UPDATE SET fingerprint=excluded.fingerprint, revision=excluded.revision", [event.eventId, fingerprint, String(event.revision), baseline ? "1" : "0"])
+                if let previous {
+                    guard previous.count == 3, previous[0] != nil, ["0", "1"].contains(previous[2]) else { throw ReceiveError.corruptStore }
+                    event.revision = try positiveRevision(previous[1]) + 1
+                    if previous[0] == fingerprint { continue }
+                }
+                let baseline = previous == nil && first && !replay
+                try db.exec("INSERT INTO observations VALUES(?,?,?,?) ON CONFLICT(event_id) DO UPDATE SET fingerprint=excluded.fingerprint, revision=excluded.revision, baseline=excluded.baseline", [event.eventId, fingerprint, String(event.revision), baseline ? "1" : "0"])
                 if !baseline {
                     try db.exec("INSERT INTO deliveries(event_id,revision,account,payload) VALUES(?,?,?,?)", [event.eventId, String(event.revision), account, String(decoding: try event.json(), as: UTF8.self)])
                 }
@@ -78,10 +103,22 @@ public final class ReceiveStore {
     public func claim(account: String, now: Double, lease: Double = 30) throws -> ReceiveClaim? {
         try db.transaction {
             guard let row = try db.rows("SELECT event_id,revision,payload FROM deliveries d WHERE account=? AND state IN ('pending','leased') AND available<=? AND NOT EXISTS (SELECT 1 FROM deliveries older WHERE older.event_id=d.event_id AND older.revision<d.revision AND older.state IN ('pending','leased')) ORDER BY rowid LIMIT 1", [account, String(now)]).first else { return nil }
+            guard row.count == 3, let eventId = row[0], !eventId.isEmpty, let payload = row[2],
+                  let object = try? JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any],
+                  object["event_id"] as? String == eventId,
+                  object["account_namespace"] as? String == account else { throw ReceiveError.corruptStore }
+            let revision = try positiveRevision(row[1])
+            guard object["revision"] as? Int == revision else { throw ReceiveError.corruptStore }
             let token = UUID().uuidString
             try db.exec("UPDATE deliveries SET state='leased',token=?,available=?,attempts=attempts+1 WHERE event_id=? AND revision=?", [token, String(now + lease), row[0], row[1]])
-            return ReceiveClaim(eventId: row[0]!, revision: Int(row[1]!)!, payload: Data(row[2]!.utf8), token: token)
+            return ReceiveClaim(eventId: eventId, revision: revision, payload: Data(payload.utf8), token: token)
         }
+    }
+
+    /// Cooperative shutdown is not a sink failure and must not consume retry budget.
+    public func release(_ claim: ReceiveClaim) throws {
+        try db.exec("UPDATE deliveries SET state='pending',token=NULL,available=0,attempts=max(0,attempts-1) WHERE event_id=? AND revision=? AND token=? AND state='leased'", [claim.eventId, String(claim.revision), claim.token])
+        guard db.changes == 1 else { throw ReceiveError.staleClaim }
     }
 
     public func complete(_ claim: ReceiveClaim, now: Double) throws {
@@ -95,6 +132,11 @@ public final class ReceiveStore {
     }
 
     public func deliveryCounts() throws -> [String: Int] {
-        Dictionary(uniqueKeysWithValues: try db.rows("SELECT state,count(*) FROM deliveries GROUP BY state").map { ($0[0]!, Int($0[1]!)!) })
+        var counts: [String: Int] = [:]
+        for row in try db.rows("SELECT state,count(*) FROM deliveries GROUP BY state") {
+            guard row.count == 2, let state = row[0], let text = row[1], let count = Int(text), count >= 0 else { throw ReceiveError.corruptStore }
+            counts[state] = count
+        }
+        return counts
     }
 }

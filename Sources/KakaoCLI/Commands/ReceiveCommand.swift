@@ -6,8 +6,8 @@ import KakaoCore
 struct ReceiveCommand: ParsableCommand {
     static let configuration = CommandConfiguration(commandName: "receive", abstract: "Receive notification observations locally (durable at-least-once NDJSON; not chat history)")
     @Option(name: .long, help: "Only notif is supported; no login or Kakao database access") var source = "notif"
-    @Flag(name: .long, help: "Read one snapshot and drain currently eligible deliveries") var once = false
-    @Flag(name: .long, help: "Poll continuously; SIGINT/SIGTERM may leave a recoverable lease") var follow = false
+    @Flag(name: .long, help: "Read one snapshot and drain at most 100 eligible deliveries") var once = false
+    @Flag(name: .long, help: "Poll continuously; SIGINT/SIGTERM stop gracefully") var follow = false
     @Flag(name: .long, help: "NDJSON output (also the default)") var json = false
     @Flag(name: .long, help: "Deliver existing observations on FIRST initialization only") var replayExisting = false
     @Option(name: .long, help: "Explicit notification SQLite source; otherwise discover current user's store") var notificationDb: String?
@@ -24,24 +24,53 @@ struct ReceiveCommand: ParsableCommand {
 
     func run() throws {
         signal(SIGPIPE, SIG_IGN)
-        let sourcePath = try notificationDb ?? NotificationReader.discover()
-        let reader = try NotificationReader(path: sourcePath)
+        let stop = ReceiveStop()
+        defer { stop.close() }
         let path = inbox ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".kakaocli/receive/inbox.sqlite").path
-        guard URL(fileURLWithPath: path).resolvingSymlinksInPath() != URL(fileURLWithPath: sourcePath).resolvingSymlinksInPath() else { throw ValidationError("Inbox must not be the source database.") }
+        if let sourcePath = notificationDb {
+            guard URL(fileURLWithPath: path).resolvingSymlinksInPath() != URL(fileURLWithPath: sourcePath).resolvingSymlinksInPath() else { throw ValidationError("Inbox must not be the source database.") }
+        }
         let store = try ReceiveStore(path: path)
         repeat {
-            let snapshot = try reader.snapshot()
-            try store.ingest(snapshot.observations, account: account, source: reader.sourceId, replay: replayExisting, now: Date().timeIntervalSince1970)
-            if snapshot.malformedCount > 0 { FileHandle.standardError.write(Data("Skipped \(snapshot.malformedCount) malformed notification payload(s).\n".utf8)) }
-            while let claim = try store.claim(account: account, now: Date().timeIntervalSince1970) {
-                do { try ReceiveStdout.write(claim.payload) }
-                catch {
-                    try store.fail(claim, now: Date().timeIntervalSince1970)
-                    throw error
+            var remaining = 100
+            func drain() throws {
+                while remaining > 0 && !stop.requested {
+                    guard let claim = try store.claim(account: account, now: Date().timeIntervalSince1970) else { break }
+                    remaining -= 1
+                    do { try ReceiveStdout.write(claim.payload, shouldStop: { stop.requested }) }
+                    catch {
+                        if stop.requested {
+                            try store.release(claim)
+                            return
+                        }
+                        try store.fail(claim, now: Date().timeIntervalSince1970)
+                        throw error
+                    }
+                    try store.complete(claim, now: Date().timeIntervalSince1970)
                 }
-                try store.complete(claim, now: Date().timeIntervalSince1970)
             }
-            if follow { Thread.sleep(forTimeInterval: interval) }
-        } while follow
+            // Recovery is independent of source discovery and snapshot health.
+            try drain()
+            if stop.requested { break }
+            var sourceFailed = false
+            do {
+                let sourcePath = try notificationDb ?? NotificationReader.discover()
+                guard URL(fileURLWithPath: path).resolvingSymlinksInPath() != URL(fileURLWithPath: sourcePath).resolvingSymlinksInPath() else { throw ReceiveError.unsafeStore }
+                let reader = try NotificationReader(path: sourcePath)
+                let snapshot = try reader.snapshot()
+                if !stop.requested {
+                    try store.ingest(snapshot.observations, account: account, source: reader.sourceId, replay: replayExisting, now: Date().timeIntervalSince1970)
+                }
+                if snapshot.malformedCount > 0 { FileHandle.standardError.write(Data("Skipped \(snapshot.malformedCount) malformed notification payload(s).\n".utf8)) }
+            } catch {
+                sourceFailed = true
+                let detail = (error as? ReceiveError)?.description ?? "Operation failed (details redacted)."
+                FileHandle.standardError.write(Data("Source health: \(detail)\n".utf8))
+            }
+            try drain()
+            if stop.requested { break }
+            if once && sourceFailed { throw ExitCode.failure }
+            if follow { stop.wait(interval) }
+        } while follow && !stop.requested
     }
 }

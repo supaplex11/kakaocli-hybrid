@@ -79,5 +79,79 @@ with tempfile.TemporaryDirectory(prefix='receive-cli-', dir=scratch) as tmp:
         state.execute("UPDATE deliveries SET available=0 WHERE state='pending'")
     assert len(run()) == 1
     assert run() == []
+    # Durable retry drains before missing or locked source failures, with health on stderr.
+    for unavailable in ('missing', 'locked'):
+        with sqlite3.connect(base[-1]) as state:
+            state.execute("UPDATE deliveries SET state='pending',available=0,token=NULL WHERE rowid=(SELECT min(rowid) FROM deliveries)")
+        original_source = base[base.index('--notification-db') + 1]
+        if unavailable == 'missing':
+            base[base.index('--notification-db') + 1] = str(root / 'missing.sqlite')
+        else:
+            con.execute('BEGIN EXCLUSIVE')
+        try:
+            recovered = subprocess.run(base + ['--once'], capture_output=True, text=True, timeout=10)
+            assert recovered.returncode == 1, recovered.stderr
+            assert len(recovered.stdout.splitlines()) == 1
+            assert 'Source health:' in recovered.stderr
+        finally:
+            base[base.index('--notification-db') + 1] = original_source
+            if unavailable == 'locked':
+                con.rollback()
+        with sqlite3.connect(base[-1]) as state:
+            assert state.execute("SELECT count(*) FROM deliveries WHERE state='pending'").fetchone()[0] == 0
+
+    # A fixed invocation batch cannot drain an unbounded producer/backlog.
+    for log in range(2000, 2105):
+        insert(str(log))
+    assert len(run()) == 100
+    with sqlite3.connect(base[-1]) as state:
+        assert state.execute("SELECT count(*) FROM deliveries WHERE state='pending'").fetchone()[0] == 5
+    assert len(run()) == 5
+
+    # Both signals unwind idle waits and active backpressured writes, with no live lease.
+    import signal
+    import time
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        for active in (False, True):
+            with sqlite3.connect(base[-1]) as state:
+                state.execute("UPDATE deliveries SET state='delivered',token=NULL")
+                if active:
+                    rowid, payload = state.execute("SELECT rowid,payload FROM deliveries LIMIT 1").fetchone()
+                    obj = json.loads(payload)
+                    obj['text'] = 'synthetic' * 100000
+                    state.execute("UPDATE deliveries SET payload=?,state='pending',available=0 WHERE rowid=?", (json.dumps(obj), rowid))
+            args = base + ['--follow', '--interval', '3600']
+            if not active:
+                args[args.index('--notification-db') + 1] = str(root / 'idle-missing.sqlite')
+            process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            assert process.stdout is not None and process.stderr is not None
+            try:
+                deadline = time.monotonic() + 5
+                if active:
+                    while True:
+                        with sqlite3.connect(base[-1]) as state:
+                            leased = state.execute("SELECT count(*) FROM deliveries WHERE state='leased'").fetchone()[0]
+                        if leased:
+                            break
+                        assert time.monotonic() < deadline
+                        time.sleep(0.01)
+                else:
+                    assert select.select([process.stderr], [], [], 5)[0], 'idle receiver not ready'
+                    assert b'Source health:' in process.stderr.readline()
+                    assert process.poll() is None
+                start = time.monotonic()
+                process.send_signal(sig)
+                assert process.wait(timeout=3) == 0
+                assert time.monotonic() - start < 3
+                with sqlite3.connect(base[-1]) as state:
+                    assert state.execute("SELECT count(*) FROM deliveries WHERE state='leased'").fetchone()[0] == 0
+                    if active:
+                        assert state.execute("SELECT count(*) FROM deliveries WHERE state='pending'").fetchone()[0] == 1
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+                process.stdout.close()
+                process.stderr.close()
     con.close()
-print('PASS: baseline, replay, large string IDs, restart/dedup, follow, source unchanged, broken-pipe durable retry')
+print('PASS: baseline, replay, string IDs, dedup, follow, source unchanged, broken-pipe retry, missing/locked source recovery, 100-event bound, SIGINT/SIGTERM idle/active unwind')

@@ -34,6 +34,64 @@ final class ReceiveReaderTests: XCTestCase {
     }
 }
 final class ReceiveStoreTests: XCTestCase {
+    func testRetentionBoundaryIsolationAndReplay() throws {
+        let dir = try scratch(); defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("owned/inbox.sqlite").path
+        let store = try ReceiveStore(path: path)
+        let rows = [try synthetic("1_1"), try synthetic("1_2"), try synthetic("1_3"), try synthetic("1_4"), try synthetic("1_5")]
+        for account in ["a", "b"] {
+            try store.ingest(rows, account: account, source: "fixture", replay: true, now: 0)
+            try store.complete(XCTUnwrap(store.claim(account: account, now: 0)), now: 1)
+            try store.fail(XCTUnwrap(store.claim(account: account, now: 0)), now: 1, maxAttempts: 1)
+        }
+        let active = try XCTUnwrap(store.claim(account: "a", now: 0, lease: 1000))
+        _ = try XCTUnwrap(store.claim(account: "a", now: 0, lease: 2)) // expired but unacknowledged
+        XCTAssertEqual(try store.prune(account: "a", now: 10.999, retention: 10), 0)
+        XCTAssertEqual(try store.prune(account: "a", now: 11, retention: 10), 2)
+        XCTAssertEqual(try store.deliveryCounts(), ["delivered": 1, "dead_letter": 1, "leased": 2, "pending": 4])
+        let db = try ReceiveSQLite(path: path, readOnly: true)
+        XCTAssertEqual(try db.rows("SELECT count(*) FROM deliveries WHERE account='a' AND state IN ('delivered','dead_letter')").first?.first, "0")
+        let reopened = try ReceiveStore(path: path)
+        try reopened.ingest(rows, account: "a", source: "replacement-source", replay: true, now: 12)
+        XCTAssertEqual(try reopened.deliveryCounts(), try store.deliveryCounts())
+        try reopened.complete(active, now: 12) // retention did not steal the active lease
+        try reopened.ingest([try synthetic("1_1", body: "changed")], account: "a", source: "fixture", replay: true, now: 13)
+        XCTAssertEqual(try db.rows("SELECT revision FROM deliveries WHERE event_id=?", [ReceiveEvent(account: "a", observation: rows[0], observedAt: Date()).eventId]).first?.first, "2")
+        XCTAssertEqual(try reopened.prune(account: "b", now: 11, retention: 10), 2)
+        for invalid in [-1.0, Double.nan, Double.infinity] {
+            XCTAssertThrowsError(try store.prune(account: "a", now: 20, retention: invalid))
+        }
+        XCTAssertThrowsError(try store.prune(account: "a", now: .nan, retention: 10))
+    }
+
+    func testRetentionMigratesLegacyTerminalConservatively() throws {
+        let dir = try scratch(); defer { try? FileManager.default.removeItem(at: dir) }
+        let path = dir.appendingPathComponent("owned/inbox.sqlite").path
+        do {
+            let store = try ReceiveStore(path: path)
+            try store.ingest([try synthetic()], account: "a", source: "fixture", replay: true, now: 0)
+            try store.complete(XCTUnwrap(store.claim(account: "a", now: 0)), now: 1)
+        }
+        try fixtureDB(path, sql: "ALTER TABLE deliveries DROP COLUMN terminal_at; PRAGMA user_version=1")
+        let store = try ReceiveStore(path: path)
+        XCTAssertEqual(try store.prune(account: "a", now: 1000, retention: 10), 0)
+        XCTAssertEqual(try store.prune(account: "a", now: 1009, retention: 10), 0)
+        XCTAssertEqual(try store.prune(account: "a", now: 1010, retention: 10), 1)
+        try store.ingest([try synthetic()], account: "a", source: "fixture", replay: true, now: 1011)
+        XCTAssertNil(try store.claim(account: "a", now: 1011))
+    }
+
+    func testZeroRetentionPreservesBaselineAndPending() throws {
+        let dir = try scratch(); defer { try? FileManager.default.removeItem(at: dir) }
+        let store = try ReceiveStore(path: dir.appendingPathComponent("owned/inbox.sqlite").path)
+        try store.ingest([try synthetic()], account: "a", source: "fixture", replay: false, now: 0)
+        try store.ingest([try synthetic("1_3"), try synthetic("1_4")], account: "a", source: "fixture", replay: true, now: 1)
+        try store.complete(XCTUnwrap(store.claim(account: "a", now: 1)), now: 2)
+        XCTAssertEqual(try store.prune(account: "a", now: 2, retention: 0), 1)
+        try store.ingest([try synthetic(), try synthetic("1_3"), try synthetic("1_4")], account: "a", source: "fixture", replay: true, now: 3)
+        XCTAssertEqual(try store.deliveryCounts(), ["pending": 1])
+    }
+
     func testBaselineReplayReopenAndRevisions() throws {
         let dir = try scratch(); defer { try? FileManager.default.removeItem(at: dir) }
         let path = dir.appendingPathComponent("owned/inbox.sqlite").path

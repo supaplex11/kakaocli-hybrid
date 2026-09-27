@@ -4,7 +4,30 @@ The upstream kakaocli MIT license remains in LICENSE.
 
 ## OpenKakao
 
-Design reference and intended source for selected notification/durable-receive ports: https://github.com/JungHoonGhae/openkakao-cli . No OpenKakao implementation has been ported in this planning commit. Preserve this notice and record source commit and changed files when porting.
+Selected notification parsing and durable-receive behavior is adapted from
+[OpenKakao](https://github.com/JungHoonGhae/openkakao-cli), pinned reference commit
+`336cc9147303ed6e9b1a7c2cb39545327bffd5af` (MIT).
+
+Reference files at that commit:
+- `src/commands/notif_watch.rs` — notification database/plist observation behavior.
+- `src/receive_inbox.rs` — durable inbox, deduplication and delivery lifecycle behavior
+  (not `src/commands/receive_inbox.rs`).
+
+Local Swift adaptations and supporting integration:
+- `Sources/KakaoCore/Receive/NotificationParser.swift`
+- `Sources/KakaoCore/Receive/NotificationReader.swift`
+- `Sources/KakaoCore/Receive/ReceiveEvent.swift`
+- `Sources/KakaoCore/Receive/ReceiveSQLite.swift`
+- `Sources/KakaoCore/Receive/ReceiveStore.swift`
+- `Sources/KakaoCore/Receive/ReceiveStdout.swift`
+- `Sources/KakaoCore/Receive/ReceiveStop.swift`
+- `Sources/KakaoCLI/Commands/ReceiveCommand.swift`
+
+These are Swift adaptations, not a byte-for-byte Rust port. Local changes include
+strict identifier validation, account-namespaced identities, revisioned snapshot
+reconciliation, bounded read-only snapshots, private store checks, tokenized stdout
+leases, graceful shutdown, and configurable terminal-payload retention with durable
+fingerprints. The upstream notice and MIT terms below remain applicable.
 
 MIT License
 

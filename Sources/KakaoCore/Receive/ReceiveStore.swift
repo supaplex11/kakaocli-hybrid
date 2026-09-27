@@ -11,6 +11,8 @@ public struct ReceiveClaim {
 /// Durable at-least-once stdout outbox. Snapshot identities, not rec_id watermarks,
 /// survive record replacement and source row-id reuse. Instances are thread-confined.
 public final class ReceiveStore {
+    /// Seven days after terminal acknowledgement/quarantine; pending work never expires.
+    public static let defaultRetention: Double = 7 * 24 * 60 * 60
     private let db: ReceiveSQLite
     public init(path: String) throws {
         let url = URL(fileURLWithPath: path).standardizedFileURL
@@ -36,7 +38,7 @@ public final class ReceiveStore {
         db = try ReceiveSQLite(path: url.path, readOnly: false)
         try db.transaction {
             let version = try db.rows("PRAGMA user_version").first?.first ?? nil
-            guard version == "0" || version == "1" else { throw ReceiveError.incompatibleSchema }
+            guard version == "0" || version == "1" || version == "2" else { throw ReceiveError.incompatibleSchema }
             if version == "0" {
                 guard try db.rows("SELECT name FROM sqlite_master WHERE type='table'").isEmpty else { throw ReceiveError.incompatibleSchema }
                 try db.exec("CREATE TABLE checkpoints(account TEXT NOT NULL, source TEXT NOT NULL, PRIMARY KEY(account,source))")
@@ -44,16 +46,21 @@ public final class ReceiveStore {
                 try db.exec("CREATE TABLE deliveries(event_id TEXT NOT NULL, revision INTEGER NOT NULL, account TEXT NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, available REAL NOT NULL DEFAULT 0, token TEXT, PRIMARY KEY(event_id,revision))")
                 try db.exec("PRAGMA user_version=1")
             }
+            if version != "2" {
+                try validateSchema(legacy: true)
+                try db.exec("ALTER TABLE deliveries ADD COLUMN terminal_at REAL")
+                try db.exec("PRAGMA user_version=2")
+            }
+            try validateSchema()
         }
-        try validateSchema()
         try db.exec("PRAGMA synchronous=FULL")
     }
 
-    private func validateSchema() throws {
+    private func validateSchema(legacy: Bool = false) throws {
         let expected: [String: [(String, String, String, String)]] = [
             "checkpoints": [("account","TEXT","1","1"),("source","TEXT","1","2")],
             "observations": [("event_id","TEXT","0","1"),("fingerprint","TEXT","1","0"),("revision","INTEGER","1","0"),("baseline","INTEGER","1","0")],
-            "deliveries": [("event_id","TEXT","1","1"),("revision","INTEGER","1","2"),("account","TEXT","1","0"),("payload","TEXT","1","0"),("state","TEXT","1","0"),("attempts","INTEGER","1","0"),("available","REAL","1","0"),("token","TEXT","0","0")]
+            "deliveries": [("event_id","TEXT","1","1"),("revision","INTEGER","1","2"),("account","TEXT","1","0"),("payload","TEXT","1","0"),("state","TEXT","1","0"),("attempts","INTEGER","1","0"),("available","REAL","1","0"),("token","TEXT","0","0")] + (legacy ? [] : [("terminal_at","REAL","0","0")])
         ]
         for (table, columns) in expected {
             let rows = try db.rows("PRAGMA table_info(\(table))")
@@ -122,13 +129,31 @@ public final class ReceiveStore {
     }
 
     public func complete(_ claim: ReceiveClaim, now: Double) throws {
-        try db.exec("UPDATE deliveries SET state='delivered',token=NULL WHERE event_id=? AND revision=? AND token=? AND state='leased' AND available>?", [claim.eventId, String(claim.revision), claim.token, String(now)])
+        try db.exec("UPDATE deliveries SET state='delivered',token=NULL,terminal_at=? WHERE event_id=? AND revision=? AND token=? AND state='leased' AND available>?", [String(now), claim.eventId, String(claim.revision), claim.token, String(now)])
         guard db.changes == 1 else { throw ReceiveError.staleClaim }
     }
 
     public func fail(_ claim: ReceiveClaim, now: Double, maxAttempts: Int = 8) throws {
-        try db.exec("UPDATE deliveries SET state=CASE WHEN attempts>=? THEN 'dead_letter' ELSE 'pending' END, available=? + min(300,pow(2,attempts)),token=NULL WHERE event_id=? AND revision=? AND token=? AND state='leased' AND available>?", [String(maxAttempts), String(now), claim.eventId, String(claim.revision), claim.token, String(now)])
+        try db.exec("UPDATE deliveries SET state=CASE WHEN attempts>=? THEN 'dead_letter' ELSE 'pending' END, terminal_at=CASE WHEN attempts>=? THEN ? ELSE NULL END, available=? + min(300,pow(2,attempts)),token=NULL WHERE event_id=? AND revision=? AND token=? AND state='leased' AND available>?", [String(maxAttempts), String(maxAttempts), String(now), String(now), claim.eventId, String(claim.revision), claim.token, String(now)])
         guard db.changes == 1 else { throw ReceiveError.staleClaim }
+    }
+
+    /// Logical payload deletion only, not physical secure erasure. Keep compact
+    /// observation fingerprints/revisions and checkpoints so source replay cannot flood.
+    /// The account predicate and state predicate protect other accounts and all
+    /// unacknowledged work, including expired leases. Clock supplied for deterministic tests.
+    @discardableResult
+    public func prune(account: String, now: Double, retention: Double = ReceiveStore.defaultRetention) throws -> Int {
+        guard now.isFinite, retention.isFinite, retention >= 0, (now - retention).isFinite else {
+            throw ReceiveError.invalidRetention
+        }
+        return try db.transaction {
+            // v1 did not record completion time. Start a full retention window at
+            // first maintenance, rather than guessing from a lease/retry timestamp.
+            try db.exec("UPDATE deliveries SET terminal_at=? WHERE account=? AND state IN ('delivered','dead_letter') AND terminal_at IS NULL", [String(now), account])
+            try db.exec("DELETE FROM deliveries WHERE account=? AND state IN ('delivered','dead_letter') AND terminal_at<=?", [account, String(now - retention)])
+            return db.changes
+        }
     }
 
     public func deliveryCounts() throws -> [String: Int] {

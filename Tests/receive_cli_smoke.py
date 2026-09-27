@@ -153,5 +153,27 @@ with tempfile.TemporaryDirectory(prefix='receive-cli-', dir=scratch) as tmp:
                     process.wait()
                 process.stdout.close()
                 process.stderr.close()
+    # Retention option: real CLI pruning, no payload resurrection from retained source.
+    base[-1] = str(root / 'retention/inbox.sqlite')
+    assert len(run(['--replay-existing', '--retention-seconds', '0'])) == 100
+    with sqlite3.connect(base[-1]) as state:
+        assert state.execute("SELECT count(*) FROM deliveries WHERE state='delivered'").fetchone()[0] == 0
+        assert state.execute("SELECT count(*) FROM deliveries WHERE state='pending'").fetchone()[0] > 0
+    assert len(run(['--retention-seconds', '0'])) > 0
+    assert run(['--replay-existing', '--retention-seconds', '0']) == []
+    with sqlite3.connect(base[-1]) as state:
+        assert state.execute("SELECT count(*) FROM deliveries").fetchone()[0] == 0
+        assert state.execute("SELECT count(*) FROM observations").fetchone()[0] > 0
+    insert('99999')
+    assert len(run()) == 1  # default seven-day window retains a new acknowledgement
+    with sqlite3.connect(base[-1]) as state:
+        assert state.execute("SELECT count(*) FROM deliveries").fetchone()[0] == 1
+        state.execute("UPDATE deliveries SET terminal_at=0")  # synthetic clock ageing only
+    assert run() == []
+    with sqlite3.connect(base[-1]) as state:
+        assert state.execute("SELECT count(*) FROM deliveries").fetchone()[0] == 0
+    for invalid in ('-1', 'nan', 'inf'):
+        rejected = subprocess.run(base + ['--once', '--retention-seconds', invalid], capture_output=True, text=True, timeout=10)
+        assert rejected.returncode != 0 and '--retention-seconds' in rejected.stderr
     con.close()
-print('PASS: baseline, replay, string IDs, dedup, follow, source unchanged, broken-pipe retry, missing/locked source recovery, 100-event bound, SIGINT/SIGTERM idle/active unwind')
+print('PASS: baseline, replay, string IDs, dedup, follow, source unchanged, broken-pipe retry, missing/locked source recovery, 100-event bound, SIGINT/SIGTERM idle/active unwind, retention default/zero/validation/replay')

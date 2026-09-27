@@ -15,7 +15,10 @@ struct ReceiveCommand: ParsableCommand {
     @Option(name: .long, help: "Required user-assigned account namespace; change on account switch") var account: String
     @Option(name: .long, help: "Poll interval in seconds (0.1–3600)") var interval: Double = 2
 
+    @Option(name: .long, help: "Terminal payload retention in seconds (default 604800 = 7 days; 0 prunes immediately). Pending/leased work never expires; fingerprints remain.") var retentionSeconds: Double = ReceiveStore.defaultRetention
+
     mutating func validate() throws {
+        guard retentionSeconds.isFinite, retentionSeconds >= 0 else { throw ValidationError("--retention-seconds must be finite and nonnegative.") }
         guard source == "notif" else { throw ValidationError("Only --source notif is implemented.") }
         guard once != follow else { throw ValidationError("Select exactly one of --once or --follow.") }
         guard !account.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, account.utf8.count <= 256, !account.contains("\0") else { throw ValidationError("--account must be a nonempty namespace of at most 256 UTF-8 bytes.") }
@@ -32,6 +35,7 @@ struct ReceiveCommand: ParsableCommand {
         }
         let store = try ReceiveStore(path: path)
         repeat {
+            try store.prune(account: account, now: Date().timeIntervalSince1970, retention: retentionSeconds)
             var remaining = 100
             func drain() throws {
                 while remaining > 0 && !stop.requested {
@@ -68,6 +72,7 @@ struct ReceiveCommand: ParsableCommand {
                 FileHandle.standardError.write(Data("Source health: \(detail)\n".utf8))
             }
             try drain()
+            try store.prune(account: account, now: Date().timeIntervalSince1970, retention: retentionSeconds)
             if stop.requested { break }
             if once && sourceFailed { throw ExitCode.failure }
             if follow { stop.wait(interval) }

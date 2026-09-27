@@ -21,14 +21,14 @@ public enum NotificationParser {
             guard let number = Int64(value), number > 0 else { return false }
             return String(number) == value
         }) else { return nil }
+        var seconds: Double?
+        if let d = root["date"] as? Date { seconds = d.timeIntervalSinceReferenceDate }
+        else if let n = root["date"] as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() { seconds = n.doubleValue }
+        else if let s = root["date"] as? String { seconds = Double(s) }
+        // Native binary-plist dates can also contain NaN, infinity or out-of-range values.
+        // Keep the observation, but treat any invalid timestamp as unknown before fingerprinting.
         var date: Date?
-        if let d = root["date"] as? Date { date = d }
-        else {
-            var seconds: Double?
-            if let n = root["date"] as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() { seconds = n.doubleValue }
-            else if let s = root["date"] as? String { seconds = Double(s) }
-            if let s = seconds, s.isFinite, abs(s) < 100_000_000_000 { date = Date(timeIntervalSinceReferenceDate: s) }
-        }
+        if let s = seconds, s.isFinite, abs(s) < 100_000_000_000 { date = Date(timeIntervalSinceReferenceDate: s) }
         return NotificationObservation(chatId: ids[0], logId: ids[1], title: req["titl"] as? String,
             text: req["body"] as? String, attachmentPath: (req["atta"] as? [[String: Any]])?.first?["pat"] as? String, notificationAt: date)
     }

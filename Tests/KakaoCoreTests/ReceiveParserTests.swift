@@ -23,6 +23,19 @@ final class ReceiveParserTests: XCTestCase {
             XCTAssertNil(NotificationParser.parse(try payload(id)))
         }
     }
+    func testInvalidBinaryPlistDatesBecomeUnknown() throws {
+        for seconds in [Double.nan, .infinity, -.infinity, 100_000_000_000, -100_000_000_000, 1e15, -1e15] {
+            for date: Any in [seconds, String(seconds), Date(timeIntervalSinceReferenceDate: seconds)] {
+                let data = try payload(date: date)
+                XCTAssertTrue(data.starts(with: Data("bplist00".utf8)))
+                let observation = try XCTUnwrap(NotificationParser.parse(data))
+                XCTAssertNil(observation.notificationAt, "Rejected timestamp: \(seconds)")
+                // The ingest fingerprint uses JSONEncoder before committing the snapshot.
+                XCTAssertNoThrow(try JSONEncoder().encode(observation))
+                XCTAssertNoThrow(try ReceiveEvent(account: "fixture", observation: observation, observedAt: Date()).json())
+            }
+        }
+    }
     func testDatesAndHiddenPreview() throws {
         for date: Any in [123, 123.0, "123", Date(timeIntervalSinceReferenceDate: 123)] {
             XCTAssertEqual(NotificationParser.parse(try payload(date: date))?.notificationAt, Date(timeIntervalSinceReferenceDate: 123))

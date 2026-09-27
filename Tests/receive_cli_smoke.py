@@ -175,5 +175,30 @@ with tempfile.TemporaryDirectory(prefix='receive-cli-', dir=scratch) as tmp:
     for invalid in ('-1', 'nan', 'inf'):
         rejected = subprocess.run(base + ['--once', '--retention-seconds', invalid], capture_output=True, text=True, timeout=10)
         assert rejected.returncode != 0 and '--retention-seconds' in rejected.stderr
+    # Mixed binary-plist Date snapshot: malformed timestamps must not roll back valid rows.
+    import datetime
+    import struct
+    base[-1] = str(root / 'malformed-dates/inbox.sqlite')
+    assert run() == []  # baseline earlier fixtures, then ingest one mixed snapshot
+    sentinel = datetime.datetime(2001, 1, 1)
+    date_marker = b'\x33' + struct.pack('>d', 0.0)
+    malformed_logs = set()
+    for index, seconds in enumerate((float('nan'), float('inf'), -float('inf'), 1e11, -1e11, 1e15, -1e15)):
+        log = str(3000 + index)
+        malformed_logs.add(log)
+        blob = plistlib.dumps({'req': {'iden': f'9007199254740993_{log}', 'body': 'synthetic malformed date'}, 'date': sentinel}, fmt=plistlib.FMT_BINARY)
+        assert blob.count(date_marker) == 1
+        # Patch the native date object's IEEE-754 value; plistlib datetime cannot represent NaN/inf.
+        blob = blob.replace(date_marker, b'\x33' + struct.pack('>d', seconds), 1)
+        con.execute('INSERT INTO record(app_id,data) VALUES(1,?)', (blob,))
+    insert('4000')  # commits valid and malformed rows together, valid row last
+    mixed = run()
+    assert {event['log_id'] for event in mixed} == malformed_logs | {'4000'}
+    assert all(event['notification_at'] is None for event in mixed)
+    with sqlite3.connect(base[-1]) as state:
+        assert state.execute("SELECT count(*) FROM deliveries WHERE state='delivered'").fetchone()[0] == len(mixed)
+    assert run() == []  # persisted dedup, malformed records remain in source
+    insert('4001')
+    assert [event['log_id'] for event in run()] == ['4001']
     con.close()
-print('PASS: baseline, replay, string IDs, dedup, follow, source unchanged, broken-pipe retry, missing/locked source recovery, 100-event bound, SIGINT/SIGTERM idle/active unwind, retention default/zero/validation/replay')
+print('PASS: mixed malformed native Date snapshot ingestion/restart/dedup, baseline, replay, string IDs, dedup, follow, source unchanged, broken-pipe retry, missing/locked source recovery, 100-event bound, SIGINT/SIGTERM idle/active unwind, retention default/zero/validation/replay')

@@ -1,27 +1,19 @@
 import CommonCrypto
 import Foundation
+import IOKit
+import Darwin
 
 /// Extracts device UUID and KakaoTalk user ID from the local system.
 public enum DeviceInfo {
 
-    /// Get the IOPlatformUUID from IORegistry.
+    /// Direct IOKit lookup: no subprocess, pipe deadlock or unbounded waitUntilExit.
     public static func platformUUID() throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/sbin/ioreg")
-        process.arguments = ["-rd1", "-c", "IOPlatformExpertDevice"]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        try process.run()
-        process.waitUntilExit()
-
-        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        // Parse: "IOPlatformUUID" = "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
-        guard let range = output.range(of: #""IOPlatformUUID" = "([^"]+)""#, options: .regularExpression),
-              let uuidRange = output[range].range(of: #"[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}"#, options: .regularExpression)
-        else {
-            throw KakaoError.uuidNotFound
-        }
-        return String(output[uuidRange])
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPlatformExpertDevice"))
+        guard service != 0 else { throw KakaoError.uuidNotFound }
+        defer { IOObjectRelease(service) }
+        guard let value = IORegistryEntryCreateCFProperty(service, "IOPlatformUUID" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? String,
+              UUID(uuidString: value) != nil else { throw KakaoError.uuidNotFound }
+        return value
     }
 
     /// Path to the KakaoTalk preferences plist.
@@ -41,90 +33,73 @@ public enum DeviceInfo {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let prefDir = "\(home)/Library/Containers/com.kakao.KakaoTalkMac/Data/Library/Preferences"
         // Find the hex-suffixed plist: com.kakao.KakaoTalkMac.<HEX>.plist
-        if let files = try? FileManager.default.contentsOfDirectory(atPath: prefDir) {
-            for file in files where file.hasPrefix("com.kakao.KakaoTalkMac.") && file.hasSuffix(".plist") && file != "com.kakao.KakaoTalkMac.plist" {
-                return "\(prefDir)/\(file)"
+        if let directory = opendir(prefDir) {
+            defer { closedir(directory) }
+            for _ in 0..<128 {
+                guard let entry = readdir(directory) else { break }
+                let file = withUnsafePointer(to: &entry.pointee.d_name) {
+                    $0.withMemoryRebound(to: CChar.self, capacity: Int(NAME_MAX) + 1) { String(cString: $0) }
+                }
+                if file.hasPrefix("com.kakao.KakaoTalkMac."), file.hasSuffix(".plist") {
+                    return "\(prefDir)/\(file)"
+                }
             }
         }
         return "\(prefDir)/com.kakao.KakaoTalkMac.plist"
     }
 
-    /// Extract user ID from the KakaoTalk preferences plist.
-    ///
-    /// Tries multiple strategies in order:
-    /// 1. FSChatWindowTransparency common suffix (legacy)
-    /// 2. Direct key lookup (userId, user_id, etc.)
-    /// 3. Recover userId by reversing SHA-512 hash from plist revision keys
-    /// 4. FSChatWindowFrame_ common suffix
+    /// Bounded preferences-only detection; never reads legacy auth caches or brute-forces hashes.
+    /// Candidates are untrusted hints and must be validated against the decrypted database account.
+    public static func detectedUserIds() -> [Int] {
+        var result: [Int] = []
+        for path in [containerPreferencesPath, preferencesPath] {
+            guard let plist = boundedPreferences(path) else { continue }
+            for key in ["userId", "user_id", "KAKAO_USER_ID", "userID"] {
+                if let id = positiveID(plist[key]), !result.contains(id) { result.append(id) }
+            }
+            for prefix in ["FSChatWindowTransparency", "NSWindow Frame FSChatWindowFrame_"] {
+                let suffixes = plist.keys.filter { $0.hasPrefix(prefix) }.prefix(128).map { String($0.dropFirst(prefix.count)) }
+                if suffixes.count >= 2, let suffix = longestCommonSuffix(suffixes),
+                   let id = positiveID(suffix), !result.contains(id) { result.append(id) }
+            }
+            for value in (plist["AlertKakaoIDsList"] as? [Any] ?? []).prefix(8) {
+                if let id = positiveID(value), !result.contains(id) { result.append(id) }
+            }
+            if result.count >= 8 { break }
+        }
+        return Array(result.prefix(8))
+    }
+
+    private static func positiveID(_ value: Any?) -> Int? {
+        let text: String
+        if let string = value as? String { text = string }
+        else if let number = value as? NSNumber,
+                CFGetTypeID(number) != CFBooleanGetTypeID() { text = number.stringValue }
+        else { return nil }
+        guard !text.isEmpty, text.utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }),
+              let id = Int(text), id > 0 else { return nil }
+        return id
+    }
+
+    private static func boundedPreferences(_ path: String) -> [String: Any]? {
+        let fd = Darwin.open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { return nil }
+        defer { Darwin.close(fd) }
+        var info = stat()
+        guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
+              info.st_size > 0, info.st_size <= 1_048_576 else { return nil }
+        var bytes = [UInt8](repeating: 0, count: 1_048_577)
+        let count = bytes.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, $0.count) }
+        guard count > 0, count <= 1_048_576 else { return nil }
+        return (try? PropertyListSerialization.propertyList(from: Data(bytes.prefix(count)), format: nil)) as? [String: Any]
+    }
+
     public static func userId() throws -> Int {
-        let plistPaths = [containerPreferencesPath, preferencesPath]
-        for plistPath in plistPaths {
-            guard FileManager.default.fileExists(atPath: plistPath) else { continue }
-
-            let url = URL(fileURLWithPath: plistPath)
-            let data = try Data(contentsOf: url)
-            guard let plist = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else {
-                continue
-            }
-
-            // Strategy 1: Extract common suffix from FSChatWindowTransparency keys
-            let transparencyPrefix = "FSChatWindowTransparency"
-            let fsChatKeys = plist.keys.filter { $0.hasPrefix(transparencyPrefix) }
-            if fsChatKeys.count >= 2 {
-                let suffixes = fsChatKeys.map { String($0.dropFirst(transparencyPrefix.count)) }
-                if let commonSuffix = longestCommonSuffix(suffixes), let id = Int(commonSuffix) {
-                    return id
-                }
-            }
-
-            // Strategy 2: Direct key lookup
-            let candidateKeys = ["userId", "user_id", "KAKAO_USER_ID", "userID"]
-            for key in candidateKeys {
-                if let id = plist[key] as? Int { return id }
-                if let str = plist[key] as? String, let id = Int(str) { return id }
-            }
-
-            // Strategy 3: Recover userId from SHA-512 hash in plist revision keys.
-            // Newer KakaoTalk stores SHA-512(userId) as a suffix on keys like
-            // "DESIGNATEDFRIENDSREVISION:<sha512hex>". The active account has non-zero values.
-            // We brute-force the pre-image since userIds are typically small integers.
-            if let hash = activeAccountHash(from: plist) {
-                if let id = recoverUserIdFromSHA512(hexHash: hash) {
-                    return id
-                }
-            }
-
-            // Strategy 4: FSChatWindowFrame_ common suffix (newer KakaoTalk versions)
-            let framePrefix = "NSWindow Frame FSChatWindowFrame_"
-            let frameKeys = plist.keys.filter { $0.hasPrefix(framePrefix) }
-            if frameKeys.count >= 2 {
-                let suffixes = frameKeys.map { String($0.dropFirst(framePrefix.count)) }
-                if let commonSuffix = longestCommonSuffix(suffixes), let id = Int(commonSuffix) {
-                    return id
-                }
-            }
-        }
-
-        throw KakaoError.userIdNotFound(["Could not extract from FSChatWindowTransparency, revision key SHA-512, or FSChatWindowFrame_ keys"])
+        guard let id = detectedUserIds().first else { throw DatabaseAccessError.missingUserId }
+        return id
     }
 
-    /// Read AlertKakaoIDsList from plist as candidate user IDs.
-    public static func candidateUserIds() -> [Int] {
-        let plistPaths = [containerPreferencesPath, preferencesPath]
-        for plistPath in plistPaths {
-            guard FileManager.default.fileExists(atPath: plistPath),
-                  let data = try? Data(contentsOf: URL(fileURLWithPath: plistPath)),
-                  let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
-                  let ids = plist["AlertKakaoIDsList"] as? [Any] else { continue }
-
-            return ids.compactMap { item -> Int? in
-                if let id = item as? Int { return id > 0 ? id : nil }
-                if let str = item as? String, let id = Int(str) { return id > 0 ? id : nil }
-                return nil
-            }
-        }
-        return []
-    }
+    public static func candidateUserIds() -> [Int] { detectedUserIds() }
 
     /// Discover database file by scanning the container for 78-char hex filenames.
     public static func discoverDatabaseFile() -> String? {
@@ -194,18 +169,18 @@ public enum DeviceInfo {
     /// Recover a userId by brute-forcing the SHA-512 pre-image.
     /// KakaoTalk stores SHA-512(userId) as hex in plist keys. Since userIds are
     /// typically small integers, this is fast (< 1 second for IDs under 1M).
-    /// Searches up to 1 billion with a 10-second timeout.
-    public static func recoverUserIdFromSHA512(hexHash: String) -> Int? {
-        guard hexHash.count == 128 else { return nil }
+    /// Explicit library-only helper, never used in auto detection. Default 250 ms; max 10 seconds.
+    public static func recoverUserIdFromSHA512(hexHash: String, timeout: TimeInterval = 0.25) -> Int? {
+        guard timeout.isFinite, timeout > 0, timeout <= 10, hexHash.count == 128 else { return nil }
         // Parse target hash to bytes
         var targetBytes = [UInt8](repeating: 0, count: 64)
-        var hexChars = Array(hexHash)
+        let hexChars = Array(hexHash)
         for i in 0..<64 {
             guard let byte = UInt8(String(hexChars[i*2...i*2+1]), radix: 16) else { return nil }
             targetBytes[i] = byte
         }
 
-        let startTime = CFAbsoluteTimeGetCurrent()
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
         let maxId = 1_000_000_000
         var hash = [UInt8](repeating: 0, count: Int(CC_SHA512_DIGEST_LENGTH))
 
@@ -216,10 +191,7 @@ public enum DeviceInfo {
             if hash == targetBytes {
                 return i
             }
-            // Timeout after 10 seconds
-            if i % 5_000_000 == 0 && i > 0 {
-                if CFAbsoluteTimeGetCurrent() - startTime > 10 { return nil }
-            }
+            if i % 64 == 0 && ProcessInfo.processInfo.systemUptime >= deadline { return nil }
         }
         return nil
     }

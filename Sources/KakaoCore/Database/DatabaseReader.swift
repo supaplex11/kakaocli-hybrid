@@ -14,54 +14,99 @@ public final class DatabaseReader: @unchecked Sendable {
         close()
     }
 
-    /// Open the database. If a key is provided, attempts PRAGMA key (requires SQLCipher).
-    /// Tries cipher compatibility modes 3 and 4 (for newer KakaoTalk versions).
+    private final class Deadline {
+        let end: TimeInterval
+        init(_ end: TimeInterval) { self.end = end }
+        var expired: Bool { ProcessInfo.processInfo.systemUptime >= end }
+    }
+    private var accessDeadline: Deadline?
+
+    private func checkDeadline() throws {
+        if accessDeadline?.expired == true { throw DatabaseAccessError.deadlineExceeded }
+    }
+
+    /// Read-only open, no busy retries, connection-local SQLCipher settings and payload-free errors.
     public func open(key: String? = nil) throws {
-        guard FileManager.default.fileExists(atPath: databasePath) else {
-            throw KakaoError.databaseNotFound(databasePath)
+        close()
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: databasePath),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              FileManager.default.isReadableFile(atPath: databasePath) else {
+            throw DatabaseAccessError.unreadableDatabase
         }
-
-        if let key {
-            // Try compatibility mode 3 first (legacy), then 4 (newer versions)
-            let compatModes = [3, 4]
-            for compat in compatModes {
-                // Close previous attempt if any
-                if db != nil { sqlite3_close(db); db = nil }
-
-                let result = sqlite3_open_v2(
-                    databasePath, &db,
-                    SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil
-                )
-                guard result == SQLITE_OK else {
-                    let msg = db.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "unknown"
-                    throw KakaoError.databaseOpenFailed(msg)
-                }
-
-                do {
-                    try exec("PRAGMA cipher_default_compatibility = \(compat)")
-                    try exec("PRAGMA KEY='\(key)'")
-                    try exec("SELECT count(*) FROM sqlite_master")
-                    return // success
-                } catch {
-                    continue
-                }
+        for compatibility in key == nil ? [0] : [3, 4] {
+            try checkDeadline()
+            if db != nil { sqlite3_close(db); db = nil }
+            guard sqlite3_open_v2(databasePath, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil) == SQLITE_OK else {
+                close()
+                throw DatabaseAccessError.unreadableDatabase
             }
-            throw KakaoError.databaseOpenFailed(
-                "PRAGMA key failed with all cipher compatibility modes — " +
-                "database is encrypted and key may be wrong, or SQLCipher may not be linked. " +
-                "Install via: brew install sqlcipher"
-            )
-        } else {
-            let result = sqlite3_open_v2(
-                databasePath, &db,
-                SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nil
-            )
-            guard result == SQLITE_OK else {
-                let msg = db.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "unknown"
-                throw KakaoError.databaseOpenFailed(msg)
+            sqlite3_busy_timeout(db, 0)
+            if let deadline = accessDeadline {
+                sqlite3_progress_handler(db, 100, { context in
+                    guard let context else { return 0 }
+                    return Unmanaged<Deadline>.fromOpaque(context).takeUnretainedValue().expired ? 1 : 0
+                }, Unmanaged.passUnretained(deadline).toOpaque())
             }
+            do {
+                if let key {
+                    guard !key.isEmpty, !key.contains("\0"), key.utf8.count <= 4096 else {
+                        throw DatabaseAccessError.invalidConfiguration
+                    }
+                    try exec("PRAGMA key='\(key.replacingOccurrences(of: "'", with: "''"))'")
+                    try exec("PRAGMA cipher_compatibility=\(compatibility)")
+                }
+                try exec("SELECT count(*) FROM sqlite_master")
+                try checkDeadline()
+                return
+            } catch {
+                try checkDeadline()
+            }
+        }
+        close()
+        throw DatabaseAccessError.invalidKeyOrDatabase
+    }
+
+    /// Validate the source schema and account while the same read-only handle is open.
+    @discardableResult
+    public func openValidated(key: String? = nil, expectedUserId: Int? = nil, timeout: TimeInterval = 2) throws -> Int64 {
+        guard timeout.isFinite, timeout > 0 else { throw DatabaseAccessError.deadlineExceeded }
+        accessDeadline = Deadline(ProcessInfo.processInfo.systemUptime + timeout)
+        defer {
+            if let db { sqlite3_progress_handler(db, 0, nil, nil) }
+            accessDeadline = nil
+        }
+        do {
+            try open(key: key)
+            let id = try validatedUserId()
+            do {
+                try exec("SELECT chatId FROM NTChatRoom LIMIT 0")
+                try exec("SELECT logId FROM NTChatMessage LIMIT 0")
+            } catch {
+                try checkDeadline()
+                throw DatabaseAccessError.incompatibleSchema
+            }
+            if let expectedUserId, id != Int64(expectedUserId) { throw DatabaseAccessError.accountMismatch }
+            try checkDeadline()
+            return id
+        } catch {
+            close()
+            throw error
         }
     }
+
+    public func validatedUserId() throws -> Int64 {
+        do {
+            let ids = try query("SELECT DISTINCT userId FROM NTChatContext LIMIT 2", bind: []) { row in
+                sqlite3_column_type(row.stmt, 0) == SQLITE_INTEGER ? row.int64(0) : 0
+            }
+            guard ids.count == 1, let id = ids.first, id > 0 else { throw DatabaseAccessError.incompatibleSchema }
+            return id
+        } catch {
+            try checkDeadline()
+            throw DatabaseAccessError.incompatibleSchema
+        }
+    }
+
 
     /// Try opening the database with a key. Returns true if the key is valid.
     public func tryOpen(key: String) -> Bool {
@@ -315,8 +360,14 @@ public final class DatabaseReader: @unchecked Sendable {
         }
 
         var results: [T] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var result = sqlite3_step(stmt)
+        while result == SQLITE_ROW {
             results.append(transform(Row(stmt: stmt!)))
+            result = sqlite3_step(stmt)
+        }
+        guard result == SQLITE_DONE else {
+            try checkDeadline()
+            throw DatabaseAccessError.invalidKeyOrDatabase
         }
         return results
     }

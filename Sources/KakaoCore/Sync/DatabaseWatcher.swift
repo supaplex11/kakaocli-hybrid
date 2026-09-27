@@ -8,13 +8,15 @@ import Foundation
 public final class DatabaseWatcher: @unchecked Sendable {
     private let databasePath: String
     private let key: String?
+    private let expectedUserId: Int?
     private let pollInterval: TimeInterval
     private var lastLogId: Int64
     private var running = false
 
-    public init(databasePath: String, key: String?, pollInterval: TimeInterval = 2.0, startFromLogId: Int64? = nil) {
+    public init(databasePath: String, key: String?, pollInterval: TimeInterval = 2.0, startFromLogId: Int64? = nil, expectedUserId: Int? = nil) {
         self.databasePath = databasePath
         self.key = key
+        self.expectedUserId = expectedUserId
         self.pollInterval = pollInterval
         self.lastLogId = startFromLogId ?? 0
     }
@@ -58,14 +60,14 @@ public final class DatabaseWatcher: @unchecked Sendable {
 
     private func fetchMaxLogId() throws -> Int64 {
         let reader = DatabaseReader(databasePath: databasePath)
-        try reader.open(key: key)
+        try reader.openValidated(key: key, expectedUserId: expectedUserId)
         defer { reader.close() }
         return try reader.maxLogId()
     }
 
     private func fetchNewMessages() throws -> [SyncMessage] {
         let reader = DatabaseReader(databasePath: databasePath)
-        try reader.open(key: key)
+        try reader.openValidated(key: key, expectedUserId: expectedUserId)
         defer { reader.close() }
         let myUserId = try reader.myUserId()
         return try reader.messagesSince(logId: lastLogId, myUserId: myUserId)
